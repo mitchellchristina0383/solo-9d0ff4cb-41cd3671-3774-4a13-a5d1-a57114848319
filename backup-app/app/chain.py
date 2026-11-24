@@ -33,6 +33,10 @@ class ConflictError(DomainError):
     """状态冲突 / 乐观锁失败（409）。"""
 
 
+class LengthMismatchError(DomainError):
+    """上传镜像长度与磁盘尺寸不符（400）。"""
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -113,6 +117,33 @@ def chain_snapshot(conn: sqlite3.Connection) -> dict:
 ZERO_HASH = hashlib.sha256(b"ZERO-MARKER-v1").hexdigest()
 
 
+def resolve_effective(conn: sqlite3.Connection, backup_id: str) -> dict[int, tuple[str, int]]:
+    """沿链折叠出该恢复点每个槽位的最终指针 {slot: (block_hash, is_zero)}。
+
+    上传追加新点时用它与“所选恢复点”的当前内容逐块比对。清退只改指针、
+    不改存活点的有效内容，所以接收期间发生清退不会让这里的比对失效。
+    """
+    target = get_backup(conn, backup_id)
+    _block_size, block_count = disk_spec(conn)
+    ordered = [b for b in list_backups(conn) if b["seq"] <= target["seq"]]
+    if not ordered:  # pragma: no cover - 目标本身存在时不可能为空
+        raise NotFoundError("链为空")
+
+    state: dict[int, tuple[str, int]] = {}
+    for b in ordered:
+        for r in list_pointers(conn, b["id"]):
+            state[r["block_index"]] = (r["block_hash"], r["is_zero"])
+
+    full = ordered[0]
+    if full["kind"] != "full":  # pragma: no cover - 种子数据保证
+        raise DomainError("链首不是全备")
+    full_indices = {r["block_index"] for r in list_pointers(conn, full["id"])}
+    missing = [i for i in range(block_count) if i not in state and i not in full_indices]
+    if missing:
+        raise DomainError(f"槽位 {missing[:5]} 无法沿链解析，数据不完整")
+    return state
+
+
 def _block_content(conn: sqlite3.Connection, block_hash: str) -> bytes:
     row = conn.execute(
         "SELECT content FROM blocks WHERE hash = ?", (block_hash,)
@@ -127,30 +158,14 @@ def materialize_blocks(conn: sqlite3.Connection, backup_id: str):
 
     缺省块沿链向前继承；显式清零块产出全零字节。
     """
-    target = get_backup(conn, backup_id)
+    get_backup(conn, backup_id)  # 不存在时立刻 404，而不是等到迭代
     block_size, block_count = disk_spec(conn)
-    ordered = [b for b in list_backups(conn) if b["seq"] <= target["seq"]]
-    if not ordered:  # pragma: no cover - 目标本身存在时不可能为空
-        raise NotFoundError("链为空")
-
-    # 沿链折叠出目标恢复点每个槽位的最终指针
-    state: dict[int, tuple[str, int]] = {}
-    for b in ordered:
-        for r in list_pointers(conn, b["id"]):
-            state[r["block_index"]] = (r["block_hash"], r["is_zero"])
-
-    full = ordered[0]
-    if full["kind"] != "full":  # pragma: no cover - 种子数据保证
-        raise DomainError("链首不是全备")
-    full_indices = {r["block_index"] for r in list_pointers(conn, full["id"])}
-    missing = [i for i in range(block_count) if i not in state and i not in full_indices]
-    if missing:
-        raise DomainError(f"槽位 {missing[:5]} 无法沿链解析，数据不完整")
+    state = resolve_effective(conn, backup_id)
 
     for i in range(block_count):
         pointer = state.get(i)
         if pointer is None:
-            # 理论上不会到这里：全备应覆盖全部槽位
+            # 理论上不会到这里：resolve_effective 已校验全备覆盖全部槽位
             yield b"\x00" * block_size
             continue
         block_hash, is_zero = pointer

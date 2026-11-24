@@ -59,8 +59,64 @@ CREATE TABLE IF NOT EXISTS staged_blocks (
     PRIMARY KEY (job_id, block_index)
 );
 
+-- 上传追加恢复点的任务。上传期间只写下面几张暂存表，blocks/backups 不动；
+-- 只有完整收齐、且所选恢复点仍是链尾时，才在一个事务里转正。
+CREATE TABLE IF NOT EXISTS upload_jobs (
+    id                 TEXT PRIMARY KEY,     -- UUID
+    parent_id          TEXT NOT NULL,        -- 管理员选定的链尾
+    parent_seq         INTEGER NOT NULL,
+    parent_fingerprint TEXT NOT NULL,        -- 接收开始时父点逐槽指针的指纹
+    based_on_version   INTEGER NOT NULL,     -- 开始上传时的链版本（仅记录）
+    expected_size      INTEGER NOT NULL,     -- 块大小 × 块数
+    filename           TEXT NOT NULL,
+    label              TEXT NOT NULL,
+    state              TEXT NOT NULL CHECK (state IN ('open', 'committed', 'aborted')),
+    created_at         TEXT NOT NULL,
+    committed_at       TEXT,
+    error              TEXT,                 -- 失败/中断原因（state=aborted 时）
+    result_backup_id   TEXT,                 -- 成功后追加的恢复点
+    image_sha256       TEXT,                 -- 上传镜像整体哈希
+    received_bytes     INTEGER NOT NULL DEFAULT 0
+);
+
+-- 上传中新增的块内容暂存区（按本任务去重）。提交时才并入 blocks 表，
+-- 因此失败/中断不会在 blocks 里留下任何新块。
+CREATE TABLE IF NOT EXISTS upload_contents (
+    job_id  TEXT NOT NULL REFERENCES upload_jobs(id),
+    hash    TEXT NOT NULL,
+    size    INTEGER NOT NULL,
+    content BLOB NOT NULL,
+    PRIMARY KEY (job_id, hash)
+);
+
+-- 上传中新恢复点的块指针暂存区：与父点相同的槽位不写，显式清零写 is_zero=1。
+CREATE TABLE IF NOT EXISTS upload_pointers (
+    job_id      TEXT NOT NULL REFERENCES upload_jobs(id),
+    block_index INTEGER NOT NULL,
+    block_hash  TEXT NOT NULL,
+    is_zero     INTEGER NOT NULL,
+    PRIMARY KEY (job_id, block_index)
+);
+
+-- 接收开始时父点“有效内容”的逐槽快照。逐块比对只查这一张表，
+-- 不把整盘或整张父点指针表放进内存；清退只改指针不改有效内容，
+-- 所以接收期间父点被并发清退也不影响比对。
+CREATE TABLE IF NOT EXISTS upload_parent_blocks (
+    job_id      TEXT NOT NULL REFERENCES upload_jobs(id),
+    block_index INTEGER NOT NULL,
+    block_hash  TEXT NOT NULL,
+    is_zero     INTEGER NOT NULL,
+    PRIMARY KEY (job_id, block_index)
+);
+
 CREATE INDEX IF NOT EXISTS idx_bb_lookup
     ON backup_blocks (backup_id, block_index);
+
+CREATE INDEX IF NOT EXISTS idx_upload_pointers_job
+    ON upload_pointers (job_id, block_index);
+
+CREATE INDEX IF NOT EXISTS idx_upload_contents_job
+    ON upload_contents (job_id);
 """
 
 

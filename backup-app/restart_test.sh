@@ -3,6 +3,7 @@
 set -u
 export PYTHONPATH=/workspace/tools/pylibs
 export BACKUP_DB=/tmp/livedata/live.db
+mkdir -p /tmp/livedata
 rm -f /tmp/livedata/live.db*
 
 start() {
